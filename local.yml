@@ -1,0 +1,145 @@
+
+---
+- name: CSC 424 Project 2 - Security Hardening
+  hosts: localhost
+  connection: local
+  become: true
+
+  tasks:
+    - name: Disable SSH root login and password authentication
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-course.conf
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload SSH
+
+    - name: Allow SSH through firewall
+      ansible.builtin.command: ufw allow 22/tcp
+      changed_when: false
+
+    - name: Set firewall default incoming policy
+      ansible.builtin.command: ufw default deny incoming
+      changed_when: false
+
+    - name: Enable firewall
+      ansible.builtin.command: ufw --force enable
+      changed_when: false
+
+    - name: Remove suspicious cron job
+      ansible.builtin.file:
+        path: /etc/cron.d/sysstat-collect
+        state: absent
+
+    - name: Stop and disable rogue service
+      ansible.builtin.systemd_service:
+        name: debugshell
+        enabled: false
+        state: stopped
+
+    - name: Install fail2ban
+      ansible.builtin.apt:
+        name: fail2ban
+        state: present
+        update_cache: true
+
+    - name: Configure SSH fail2ban jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        content: |
+          [sshd]
+          enabled = true
+          backend = systemd
+          port = ssh
+          maxretry = 5
+          bantime = 600
+          findtime = 600
+        mode: '0644'
+      notify: Restart fail2ban
+
+    - name: Enable and start fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Secure application directory
+      ansible.builtin.file:
+        path: /var/www/app/tmp
+        state: directory
+        mode: '0750'
+
+    - name: Remove deploybot from sudo group
+      ansible.builtin.user:
+        name: deploybot
+        groups: ''
+        append: false
+
+    - name: Remove planted passwordless sudo rule
+      ansible.builtin.file:
+        path: /etc/sudoers.d/90-course-nopasswd
+        state: absent
+
+    - name: Remove passwordless sudo from cloud-init rule
+      ansible.builtin.replace:
+        path: /etc/sudoers.d/90-cloud-init-users
+        regexp: 'NOPASSWD:'
+        replace: 'PASSWD:'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Remove SUID permission from diagtool
+      ansible.builtin.file:
+        path: /usr/local/bin/diagtool
+        mode: 'u-s'
+
+    - name: Lock kioskuser account
+      ansible.builtin.user:
+        name: kioskuser
+        password_lock: true
+
+    - name: Secure CRM credentials file
+      ansible.builtin.file:
+        path: /opt/crm/.env
+        mode: '0600'
+
+    - name: Restrict webapp database privileges
+      ansible.builtin.command: >
+        mysql -e "REVOKE ALL PRIVILEGES, GRANT OPTION
+        FROM 'webapp'@'%';
+        GRANT SELECT, INSERT, UPDATE, DELETE
+        ON portaldb.* TO 'webapp'@'%';"
+      changed_when: false
+
+    - name: Restrict reporting account to read-only
+      ansible.builtin.command: >
+        mysql -e "REVOKE INSERT, UPDATE, DELETE
+        ON portaldb.* FROM 'reporting'@'%';"
+      register: reporting_result
+      failed_when:
+        - reporting_result.rc != 0
+        - "'There is no such grant' not in reporting_result.stderr"
+      changed_when: false
+
+    - name: Remove remote root database account
+      ansible.builtin.command: >
+        mysql -e "DROP USER IF EXISTS 'root'@'%';"
+      changed_when: false
+
+    - name: Remove anonymous database account
+      ansible.builtin.command: >
+        mysql -e "DROP USER IF EXISTS ''@'localhost';"
+      changed_when: false
+
+  handlers:
+    - name: Reload SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
